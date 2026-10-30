@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# JavaScript app artifacts
+node_modules/
+dist/
+*.tsbuildinfo
