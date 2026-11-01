@@ -1,48 +1,46 @@
-# BLACKBOX
+# BLACKBOX — video to 3D
 
-BLACKBOX is a local, Meta Model API connected workspace for reviewing short, stationary-camera vehicle and workplace incident clips. The browser never receives the Meta API key. Muse Spark 1.3 creates a structured scene hypothesis; SAM 3.1 returns video masks; the local service extracts ground-contact tracks, applies a planar scale hypothesis or analyst-entered scale, and calculates track-based motion estimates.
+BLACKBOX turns short videos into interactive 3D scene estimates. The current prototype is optimized for stationary cameras, visible flat ground planes, and moving objects that remain on that plane. It combines Meta Muse Spark scene interpretation, SAM 3.1 object masks, local trajectory fitting, a Three.js scene viewer, and a deterministic counterfactual simulator.
 
 ## Start the workspace
 
-Requirements: Node.js 18 or newer, Python 3.10 or newer, and a Meta Model API key with access to Muse Spark 1.3 and SAM 3.1.
+1. Create a Meta Model API key and place it in `.env` as `MODEL_API_KEY=...`. The development script creates `.env` from `.env.example` on first launch. The key stays on the local server.
+2. Run `npm run dev` from the project directory.
+3. Open `http://127.0.0.1:5173`, choose **New video**, and upload a clip.
+4. Review the 3D scene and ground-plane estimate. For physics chat, drag the four ground-plane corners onto a known flat rectangle and enter its measured width and length.
+5. Open **Ask the scene** to request a counterfactual in natural language. Muse Spark translates the request into bounded structured parameters; the local deterministic engine calculates the motion.
 
-```sh
-npm install
-npm run dev
-```
+The API is at `127.0.0.1:8000`; Vite proxies `/api` requests to it. Source clips and scene data are stored locally in the ignored `data/` folder. Videos are also uploaded to Meta for inference. Inference requests disable response storage and BLACKBOX requests deletion of the temporary Meta file after processing when the API allows it. Remote deletion is best effort and Meta account policies still apply. SAM video processing is billed per frame for each detected object type, so check current [Meta pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits).
 
-The first run creates a Python virtual environment, installs the local analysis service, and creates `.env` from `.env.example`. Open `.env` in the project folder, add the Meta key, and save:
+## Current input limits
 
-```dotenv
-MODEL_API_KEY=your_meta_model_api_key
-```
+- MP4 or MOV containers with H.264, H.265, or MPEG-4 video
+- 15 seconds maximum
+- 100 MB maximum
+- No side longer than 1,920 pixels and no more than 2.1 megapixels per frame
+- 60 FPS maximum
+- The complete clip is decoded before it is accepted; truncated and malformed media is rejected
 
-The development server watches `.env` and reloads the API process. Open the local Vite address printed in the terminal (normally `http://127.0.0.1:5173`), then choose **Test Meta**. The test makes a small Muse Spark request. The same key is used for Muse Spark and SAM 3.1; no model key is entered in the browser.
+Muse Spark identifies relevant object classes first. SAM 3.1 is then called only for the object types found in that scene, reducing unnecessary full-video inference requests while retaining the clip's source frame cadence for motion tracking.
 
-## Analyze a clip
+## What the prototype produces
 
-1. Choose **New case**, select an MP4 or MOV video (up to 250 MB and 90 seconds), and submit it.
-2. Follow the analysis stage and progress in Reconstruction. The original clip is stored under the local `data/` directory and uploaded to Meta for model processing. Response persistence is disabled on inference requests, and BLACKBOX requests deletion of the temporary Meta file after analysis; remote deletion is best effort, and the account's Meta data policy still applies. Meta's [Zero Data Retention mode](https://dev.meta.ai/help/policies-and-privacy/zero-data-retention) is separately enabled for eligible organizations and does not support Files API uploads. SAM video segmentation is billed per processed video frame; this flow sends three SAM requests (vehicle, pedestrian, and stationary obstruction), so check your current [Meta API pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits) before processing a large clip.
-3. Review the model’s scene hypothesis and SAM tracks. Use the four draggable ground-plane corners and enter the measured rectangle width and length to apply an analyst-entered scale. This reprojects the saved track points and recalculates metric values.
-4. Review the findings and export the estimate CSV. Counterfactuals are limited to a stopping-distance calculation when a metric track and scale are available.
+- SAM 3.1 boxes and masks for moving objects and identified static obstructions.
+- Ground-contact point estimates, smoothed over time to reduce segmentation jitter.
+- A planar camera homography when a plausible reference is visible, with unknown scale kept explicit.
+- A Three.js environment with a ground plane, class-based 3D object proxies, estimated static obstacle volumes, trajectory paths, lighting, shadows, orbit, pan, zoom, and fullscreen controls.
+- Playback synchronized to the source video and reconstructed object tracks.
+- Conversational what-if changes for an object's speed, start time, heading, braking, gravity/friction-limited motion, or removal of a detected obstruction.
+- Deterministic numerical motion and approximate collision response after Muse Spark returns validated parameter values.
 
-Case metadata and analysis are stored in `data/blackbox.sqlite3`; source video files are stored in `data/uploads/`. Both are ignored by Git. Use **Retry analysis** after a temporary API failure. Remove a case through `DELETE /api/cases/{case_id}` or remove the local `data/` directory when the service is stopped.
+For physics chat, a user must enter a known ground-plane measurement. Muse Spark does not write simulated outcomes; it only returns a structured, range-checked parameter change. The engine fits constant acceleration to observed metric tracks, integrates at the clip frame rate (capped at 60 Hz), applies friction-limited braking, and uses circular object proxies for contact events. Multiple chat requests build on the prior scenario state; **Reset scene** returns to the reconstructed tracks.
 
-## What the connected pipeline calculates
+## Accuracy limits
 
-- Muse Spark returns a constrained JSON hypothesis for scene type, actors, possible impact time, obstacles, limitations, and possible calibration evidence. These are model outputs, not facts verified by BLACKBOX.
-- SAM 3.1 is called for vehicles, pedestrians, and stationary obstructions. The local service decodes mask rasters, finds bottom-edge contact points, and smooths the resulting coordinates with local quadratic fits over a short centered window.
-- A planar homography maps pixel coordinates to meters when an analyst supplies a measured rectangle, or when a model-proposed scale passes basic geometry checks. Every scale remains marked for review. If no scale is available, the UI keeps tracks in pixels and suppresses metric speeds.
-- Speeds are point-to-point estimates from detected contacts. The trajectory residual comes from a least-squares constant-acceleration fit. The application does not yet implement an inverse optimizer that searches braking and friction parameters, impact momentum conservation, a full rigid-body collision model, obstacle raycasting, or a validated driver-sightline analysis.
-- The uploaded-case counterfactual calculator applies `d = v·tᵣ + v²/(2μg)` to a selected speed, reaction time, and friction. It does not know the clip’s clear hazard distance and does not make a preventability or liability determination.
+A monocular video cannot reveal hidden surfaces, exact depth, or reliable object dimensions by itself. BLACKBOX labels uncalibrated coordinates as relative, asks for a measured scale before physics simulation, and distinguishes detected track data from simulated outcomes. Vertical object sizes and collision footprints are class-based estimates. Ground-constrained gravity changes affect friction-limited braking only; this prototype does not create airborne motion, model detailed steering, deformable bodies, or recover complete architecture. Heading changes are instantaneous, and shifted paths extrapolate outside their observed timestamps. High track-fit error is rejected before simulation. Outputs are scenario estimates, not guarantees or legal, insurance, or engineering determinations.
 
-This version is a review tool for model-assisted estimates, not a certified forensic reconstruction or legal evidence package. Confirm camera stability, ground-plane geometry, reference dimensions, frame timing, segmentation, and physical assumptions with a qualified analyst before relying on any result.
+This release supports stationary-camera clips with a mostly level visible surface. Moving cameras, tumbling/zooming footage, complex elevation changes, occluded trajectories, and scenes without enough metric observations may require stabilization, additional measurements, or may be refused by the simulator. The broader platform could serve workplace safety, traffic, robotics, sports, engineering, and education, but those specialized workflows are not separately implemented here.
 
-## Development and checks
+## Verification
 
-```sh
-npm run build
-.venv/bin/pytest
-```
-
-The local service runs at `127.0.0.1:8000`; Vite proxies `/api` requests to it. `GET /api/health` is the local service health check, and `POST /api/status/test` checks Muse Spark API access. A real video analysis also exercises SAM 3.1 and requires a valid account key and model access.
+Run the frontend production build with `npm run build` and backend tests with `.venv/bin/pytest -q`. `GET /api/status` reports model names and media limits. `POST /api/status/test` checks Muse Spark access. A real upload is needed to exercise Meta SAM 3.1 segmentation.

@@ -67,9 +67,27 @@ def inspect_video(path: Path) -> dict[str, Any]:
         duration = count / fps
         if duration > config.MAX_CLIP_SECONDS:
             raise ValueError(f"Clip is {duration:.1f} seconds; the current limit is {config.MAX_CLIP_SECONDS} seconds.")
-        if width * height > 35_000_000:
-            raise ValueError("Video frame dimensions exceed the supported limit.")
-        return {"fps": fps, "frame_count": count, "width": width, "height": height, "duration_s": duration}
+        if max(width, height) > config.MAX_VIDEO_DIMENSION or width * height > config.MAX_VIDEO_PIXELS:
+            raise ValueError(f"Video resolution exceeds the supported {config.MAX_VIDEO_DIMENSION}px dimension and {config.MAX_VIDEO_PIXELS // 1_000_000} MP limits.")
+        if fps > config.MAX_VIDEO_FPS:
+            raise ValueError(f"Video frame rate is {fps:.1f} FPS; the current limit is {config.MAX_VIDEO_FPS:g} FPS.")
+
+        # Decode the complete, bounded clip before it is accepted. This catches truncated
+        # or malformed files before they reach the hosted video models.
+        decoded_frames = 1
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame is None or frame.shape[1] != width or frame.shape[0] != height:
+                raise ValueError("The uploaded video has inconsistent or malformed frame dimensions.")
+            decoded_frames += 1
+        if decoded_frames < count - 1:
+            raise ValueError("The uploaded video is truncated or could not be decoded through its final frame.")
+        duration = decoded_frames / fps
+        if duration > config.MAX_CLIP_SECONDS:
+            raise ValueError(f"Clip is {duration:.1f} seconds; the current limit is {config.MAX_CLIP_SECONDS} seconds.")
+        return {"fps": fps, "frame_count": decoded_frames, "width": width, "height": height, "duration_s": duration}
     finally:
         capture.release()
 
@@ -109,6 +127,7 @@ def _validate_hypothesis(value: dict[str, Any], metadata: dict[str, Any]) -> dic
             valid_scale = False
     calibration["available"] = bool(valid_scale)
     calibration["review_required"] = True
+    calibration["reviewed_by_user"] = False
     calibration["status"] = "model hypothesis; analyst review required" if valid_scale else "no defensible fixed-camera metric scale identified"
     value["calibration"] = calibration
     if value.get("impact_time_s") is not None:
@@ -123,6 +142,43 @@ def _validate_hypothesis(value: dict[str, Any], metadata: dict[str, Any]) -> dic
         for actor in value.get("actors", [])
     ]
     return {"hypothesis": value, "homography": matrix}
+
+
+def _segmentation_prompts(hypothesis: dict[str, Any]) -> list[tuple[str, str]]:
+    """Request masks only for actor classes Muse Spark found in this scene."""
+    actors = hypothesis.get("actors", [])
+    classes = [
+        (str(actor.get("class_name", "")).strip().lower(), str(actor.get("role", "")).strip().lower())
+        for actor in actors
+    ]
+    prompts: list[tuple[str, str]] = []
+    vehicle_terms = ("vehicle", "car", "truck", "bus", "van", "forklift", "motorcycle", "bicycle", "cyclist")
+    people_terms = ("pedestrian", "person", "worker", "athlete", "human")
+    seen: set[str] = set()
+    for class_name, role in classes:
+        if not class_name or any(word in role for word in ("static", "obstacle", "obstruction")):
+            continue
+        lowered = class_name.lower()
+        if any(term in lowered for term in vehicle_terms):
+            key, prompt = "vehicle", "vehicle"
+        elif any(term in lowered for term in people_terms):
+            key, prompt = "pedestrian", "person"
+        else:
+            key = prompt = class_name
+        if key not in seen:
+            prompts.append((key, prompt))
+            seen.add(key)
+
+    scene_type = str(hypothesis.get("scene_type", "")).lower()
+    if not prompts:
+        fallback = "vehicle" if any(term in scene_type for term in ("road", "traffic", "transport")) else "moving object"
+        prompts.append((fallback, fallback))
+    obstacle_names = [str(item).strip() for item in hypothesis.get("obstacles", []) if str(item).strip()]
+    static_actors = [class_name for class_name, role in classes if class_name and any(word in role for word in ("static", "obstacle", "obstruction"))]
+    if obstacle_names or static_actors:
+        label = obstacle_names[0] if obstacle_names else static_actors[0]
+        prompts.append(("stationary obstruction", label[:80]))
+    return prompts[:6]
 
 
 async def analyze_video(path: Path, metadata: dict[str, Any], progress: Progress) -> dict[str, Any]:
@@ -141,12 +197,14 @@ async def analyze_video(path: Path, metadata: dict[str, Any], progress: Progress
             model=config.MUSE_MODEL,
             input=[{"role": "user", "content": [
                 {"type": "input_text", "text": (
-                    "Analyze this stationary-camera road or workplace incident video conservatively. "
-                    "Return only observable scene facts and hypotheses in the required schema. "
+                    "Analyze this short, fixed-camera video of a scene with objects moving on a visible ground plane. "
+                    "It may show a road, workplace, sports, robotics, or another physical environment. "
+                    "Return observable scene facts and clearly marked hypotheses in the required schema. "
                     "For metric calibration, only use a clearly identifiable standard marking/object; "
                     "if not confidently identified, set available=false and dimensions/corners null. "
                     "image_corners must be ordered top-left, top-right, bottom-right, bottom-left in source pixels, "
-                    "and describe a single planar rectangle with stated real width/length. Do not invent speeds. "
+                    "and describe a single planar rectangle with stated real width/length. Do not invent dimensions, speeds, "
+                    "hidden geometry, or object properties. Include only visible actors and obstacles. "
                     f"Video dimensions are {metadata['width']}x{metadata['height']}, {metadata['fps']:.3f} FPS, "
                     f"duration {metadata['duration_s']:.3f}s. impact_time_s is seconds from first frame or null."
                 )},
@@ -160,14 +218,14 @@ async def analyze_video(path: Path, metadata: dict[str, Any], progress: Progress
         except (json.JSONDecodeError, TypeError) as exc:
             raise RuntimeError("Muse Spark returned a scene analysis that could not be read. Retry the case.") from exc
         validated = _validate_hypothesis(raw_hypothesis, metadata)
-        await progress(35, "segmentation", "SAM 3.1 is segmenting vehicles and pedestrians")
-        prompts = ["vehicle", "pedestrian", "stationary obstruction"]
+        prompts = _segmentation_prompts(validated["hypothesis"])
         segmentation_results: list[tuple[str, Any]] = []
-        for concept_index, concept in enumerate(prompts):
+        await progress(35, "segmentation", f"SAM 3.1 is tracking {len(prompts)} identified object type(s)")
+        for concept_index, (concept, prompt) in enumerate(prompts):
             raw_stream = await client.responses.create(
                 model=config.SAM_MODEL,
                 input=[{"role": "user", "content": [
-                    {"type": "input_text", "text": f"Segment and track every {concept} visible through this video. Return instance IDs and masks."},
+                    {"type": "input_text", "text": prompt},
                     {"type": "input_video", "file_id": remote_file_id},
                 ]}],
                 stream=True,
@@ -179,13 +237,13 @@ async def analyze_video(path: Path, metadata: dict[str, Any], progress: Progress
                     pass
                 result = await parser.final_result()
             if getattr(getattr(result, "outcome", None), "status", "completed") != "completed":
-                raise RuntimeError(f"SAM 3.1 did not finish the {concept} video segmentation. Retry the case.")
+                raise RuntimeError(f"SAM 3.1 did not finish tracking {prompt}. Retry the scene.")
             fatal_diagnostics = [diagnostic for diagnostic in getattr(result, "diagnostics", ()) if str(getattr(diagnostic.severity, "value", diagnostic.severity)).lower() == "error"]
             if fatal_diagnostics:
-                raise RuntimeError(f"SAM 3.1 could not parse the {concept} segmentation output. Retry the case.")
+                raise RuntimeError(f"SAM 3.1 could not parse the {prompt} segmentation output. Retry the scene.")
             segmentation_results.append((concept, result))
             percent = 35 + round((concept_index + 1) * 30 / len(prompts))
-            await progress(percent, "segmentation", f"SAM 3.1 finished {concept} masks")
+            await progress(percent, "segmentation", f"SAM 3.1 finished tracking {prompt}")
 
         await progress(72, "kinematics", "Converting contact points and calculating trajectory estimates")
         tracks = build_actor_tracks(
@@ -205,7 +263,7 @@ async def analyze_video(path: Path, metadata: dict[str, Any], progress: Progress
                 "classification": "automated model-assisted estimate; analyst review required",
                 "metric_scale_available": bool(calibration["available"]),
                 "deterministic_claim": "The reported trajectory calculations are deterministic given the detected points and calibration hypothesis; perception and calibration are model estimates.",
-                "not_a_finding": "This pipeline does not establish liability, prove preventability, model impact momentum, or certify legal evidence.",
+                "not_a_finding": "Scene geometry and physical properties are estimates. This pipeline does not recover hidden surfaces or verify real-world dimensions without calibration.",
             },
         }
     except AuthenticationError as exc:

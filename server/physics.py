@@ -221,10 +221,16 @@ def build_actor_tracks(
             if homography is not None:
                 try:
                     item["x_m"], item["y_m"] = project_point(homography, pixel_x, pixel_y)
+                    if "left" in observation and "right" in observation:
+                        left_point = project_point(homography, float(observation["left"]), float(observation.get("bottom", pixel_y)))
+                        right_point = project_point(homography, float(observation["right"]), float(observation.get("bottom", pixel_y)))
+                        item["footprint_width_m"] = float(hypot(right_point[0] - left_point[0], right_point[1] - left_point[1]))
                 except ValueError:
                     item["x_m"] = item["y_m"] = None
+                    item["footprint_width_m"] = None
             else:
                 item["x_m"] = item["y_m"] = None
+                item["footprint_width_m"] = None
             observations.append(item)
         observations = smooth_observations(observations)
         concept = prompts[actor_id]
@@ -305,6 +311,7 @@ def reproject_track_analysis(
     calibration.update({
         "available": True,
         "source": "Analyst-specified planar rectangle",
+        "reviewed_by_user": True,
         "evidence": "Corner positions and dimensions were entered in the BLACKBOX review workspace.",
         "confidence": None,
         "width_m": float(width_m),

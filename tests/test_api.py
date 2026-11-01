@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 from types import SimpleNamespace
 
@@ -116,6 +117,41 @@ def test_mocked_upload_analysis_retrieval_calibration_and_deletion(local_client,
     assert calibrated.status_code == 200
     assert calibrated.json()["analysis"]["provenance"]["metric_scale_available"] is True
     assert calibrated.json()["analysis"]["tracking"]["actors"][0]["kinematics"]["first_observed_speed_mph"] == pytest.approx(22.36936)
+
+    class SimulationResponses:
+        async def create(self, **kwargs):
+            assert kwargs["model"] == config.MUSE_MODEL
+            assert kwargs["store"] is False
+            return SimpleNamespace(output_text=json.dumps({
+                "supported": True,
+                "explanation": "Initial speed reduced by half.",
+                "scenario": {
+                    "actor_id": "vehicle:1", "speed_scale": 0.5, "start_time_shift_s": 0,
+                    "heading_change_deg": 0, "brake_at_s": None, "gravity_mps2": 9.81,
+                    "friction_coefficient": 0.7, "obstacles_removed": False, "obstacle_id": None,
+                },
+            }))
+
+    class SimulationClient:
+        def __init__(self, **_kwargs):
+            self.responses = SimulationResponses()
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(api, "AsyncOpenAI", SimulationClient)
+    simulated = local_client.post(
+        f"/api/cases/{case_id}/simulate",
+        json={"prompt": "Make this car slower", "current_state": {
+            "actor_id": "vehicle:1", "speed_scale": 1, "start_time_shift_s": 0,
+            "heading_change_deg": 0, "brake_at_s": None, "gravity_mps2": 9.81,
+            "friction_coefficient": 0.7, "obstacles_removed": False, "obstacle_id": None,
+        }},
+    )
+    assert simulated.status_code == 200, simulated.text
+    assert simulated.json()["scenario"]["speed_scale"] == 0.5
+    assert simulated.json()["simulation"]["actors"][0]["samples"][-1]["x_m"] == pytest.approx(20.0)
+
     removed = local_client.delete(f"/api/cases/{case_id}")
     assert removed.status_code == 204
     assert local_client.get(f"/api/cases/{case_id}").status_code == 404
